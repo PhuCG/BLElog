@@ -136,6 +136,7 @@ class BleController(
     private var currentGatt: BluetoothGatt? = null
     private var autoReconnectDevice: BluetoothDevice? = null
     private var reconnectJob: kotlinx.coroutines.Job? = null
+    private var deviceCleanupJob: kotlinx.coroutines.Job? = null
     private var manualDisconnect = false
     private var currentDeviceName: String? = null
     private val logLock = Any()
@@ -154,8 +155,17 @@ class BleController(
     }
 
     private fun deviceIdentifier(result: ScanResult): String? {
+        // Always use MAC address as primary identifier to avoid duplicates when device name changes
         val address = result.device?.address?.takeIf { it.isNullOrBlank().not() }
         return address ?: readAdvertisedName(result)?.let { "name:$it" }
+    }
+    
+    private fun findDeviceByAddress(address: String?): String? {
+        // Find device in cache by MAC address, even if identifier is different
+        if (address.isNullOrBlank()) return null
+        return devicesCache.entries.firstOrNull { 
+            it.value.device?.address == address 
+        }?.key
     }
 
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
@@ -192,30 +202,97 @@ class BleController(
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
+            val address = gatt?.device?.address ?: "unknown"
+            val statusMessage = when (status) {
+                BluetoothGatt.GATT_SUCCESS -> "SUCCESS"
+                0x01 -> "GATT_INVALID_HANDLE"
+                0x02 -> "GATT_READ_NOT_PERMITTED"
+                0x03 -> "GATT_WRITE_NOT_PERMITTED"
+                0x04 -> "GATT_INVALID_PDU"
+                0x05 -> "GATT_INSUFFICIENT_AUTHENTICATION"
+                0x06 -> "GATT_REQUEST_NOT_SUPPORTED"
+                0x07 -> "GATT_INVALID_OFFSET"
+                0x08 -> "GATT_INSUFFICIENT_AUTHORIZATION"
+                0x09 -> "GATT_PREPARE_QUEUE_FULL"
+                0x0a -> "GATT_ATTRIBUTE_NOT_FOUND"
+                0x0b -> "GATT_ATTRIBUTE_NOT_LONG"
+                0x0c -> "GATT_INSUFFICIENT_ENCRYPTION_KEY_SIZE"
+                0x0d -> "GATT_INVALID_ATTRIBUTE_LENGTH"
+                0x0e -> "GATT_UNLIKELY_ERROR"
+                0x0f -> "GATT_INSUFFICIENT_ENCRYPTION"
+                0x10 -> "GATT_UNSUPPORTED_GROUP_TYPE"
+                0x11 -> "GATT_INSUFFICIENT_RESOURCES"
+                0x85 -> "GATT_INTERNAL_ERROR"
+                0x86 -> "GATT_WRONG_STATE"
+                0x87 -> "GATT_DB_FULL"
+                0x88 -> "GATT_BUSY"
+                0x89 -> "GATT_ERROR"
+                0x8a -> "GATT_CMD_STARTED"
+                0x8b -> "GATT_ILLEGAL_PARAMETER"
+                0x101 -> "GATT_NO_RESOURCES"
+                0x102 -> "GATT_INTERNAL_ERROR"
+                0x103 -> "GATT_WRONG_STATE"
+                0x104 -> "GATT_DB_FULL"
+                0x105 -> "GATT_BUSY"
+                0x106 -> "GATT_ERROR"
+                0x107 -> "GATT_CMD_STARTED"
+                0x108 -> "GATT_ILLEGAL_PARAMETER"
+                0x109 -> "GATT_PENDING"
+                0x10a -> "GATT_AUTH_FAIL"
+                0x10b -> "GATT_MORE"
+                0x10c -> "GATT_INVALID_CFG"
+                0x10d -> "GATT_SERVICE_STARTED"
+                0x10e -> "GATT_ENCRYPED_MITM"
+                0x10f -> "GATT_ENCRYPED_NO_MITM"
+                0x110 -> "GATT_NOT_ENCRYPTED"
+                0x111 -> "GATT_CONGESTED"
+                0x112 -> "GATT_DUP_REG"
+                0x113 -> "GATT_ALREADY_OPEN"
+                0x114 -> "GATT_CANCEL"
+                else -> "UNKNOWN($status)"
+            }
+            
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    val address = gatt?.device?.address
-                    _connectedAddress.value = address
-                    gatt?.discoverServices()
-                    mainHandler.post(rssiReader)
-                    autoReconnectDevice = gatt?.device
-                    currentDeviceName = gatt?.device?.name
-                        ?: address?.let { devicesCache[it]?.displayName }
-                        ?: address
-                    val wasReconnecting = _reconnecting.value
-                    cancelReconnect()
-                    _automationState.value = true
-                    appendHistory(
-                        if (wasReconnecting) "RECONNECTED $address" else "CONNECTED $address",
-                        currentDeviceName
-                    )
-                    scope.launch {
-                        _errors.emit("Connected to ${currentDeviceName ?: address}")
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        _connectedAddress.value = address
+                        gatt?.discoverServices()
+                        mainHandler.post(rssiReader)
+                        autoReconnectDevice = gatt?.device
+                        currentDeviceName = gatt?.device?.name
+                            ?: address.let { devicesCache[it]?.displayName }
+                            ?: address
+                        val wasReconnecting = _reconnecting.value
+                        cancelReconnect()
+                        _automationState.value = true
+                        appendHistory(
+                            if (wasReconnecting) "RECONNECTED $address" else "CONNECTED $address",
+                            currentDeviceName
+                        )
+                        scope.launch {
+                            _errors.emit("Connected to ${currentDeviceName ?: address}")
+                        }
+                    } else {
+                        // Connection failed
+                        scope.launch {
+                            _errors.emit("Connection failed: $statusMessage (code: $status)")
+                        }
+                        appendHistory("CONNECT_FAILED $address: $statusMessage ($status)", currentDeviceName)
+                        _connectedAddress.value = null
+                        closeGatt()
+                        if (_automationState.value && !manualDisconnect) {
+                            scheduleReconnect()
+                        }
                     }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
+                    val errorMsg = if (status != BluetoothGatt.GATT_SUCCESS) {
+                        "Disconnected with error: $statusMessage (code: $status)"
+                    } else {
+                        "Disconnected (status: $status)"
+                    }
                     scope.launch {
-                        _errors.emit("Disconnected (${status})")
+                        _errors.emit(errorMsg)
                     }
                     mainHandler.removeCallbacks(rssiReader)
                     _connectedAddress.value = null
@@ -223,10 +300,10 @@ class BleController(
                         cancelReconnect()
                         autoReconnectDevice = null
                         _automationState.value = false
-                        appendHistory("MANUAL_DISCONNECTED ${gatt?.device?.address ?: "unknown"}", currentDeviceName)
+                        appendHistory("MANUAL_DISCONNECTED $address", currentDeviceName)
                         currentDeviceName = null
                     } else {
-                        appendHistory("REMOTE_DISCONNECTED (status=$status)", currentDeviceName)
+                        appendHistory("REMOTE_DISCONNECTED $address: $statusMessage ($status)", currentDeviceName)
                         autoReconnectDevice = gatt?.device ?: autoReconnectDevice
                         if (_automationState.value) {
                             scheduleReconnect()
@@ -377,6 +454,10 @@ class BleController(
         _isAdvertising.value = false
         closeGattServer()
         appendHistory("ADVERTISING_STOPPED", deviceName = null)
+        
+        // Schedule cleanup of devices that haven't been seen recently
+        // This will remove devices from nearby list when advertising stops
+        scheduleDeviceCleanup()
     }
 
     fun startScan() {
@@ -396,6 +477,8 @@ class BleController(
             scanner.startScan(listOf(filter), settings, scanCallback)
             _isScanning.value = true
             appendHistory("SCAN_STARTED", deviceName = null)
+            // Start periodic cleanup of stale devices while scanning
+            startDeviceCleanupJob()
         } catch (sec: SecurityException) {
             _errors.tryEmit("Missing permission for scanning.")
             appendHistory("SCAN_FAILED Missing permission", deviceName = null)
@@ -411,6 +494,10 @@ class BleController(
         }
         _isScanning.value = false
         appendHistory("SCAN_STOPPED", deviceName = null)
+        // Clean up devices that haven't been seen recently
+        scheduleDeviceCleanup()
+        // Stop periodic cleanup
+        stopDeviceCleanupJob()
     }
 
     fun clearDiscoveredDevices(): Boolean {
@@ -432,6 +519,7 @@ class BleController(
         val device = devicesCache[address]?.device
         if (device == null) {
             _errors.tryEmit("Device $address not found")
+            appendHistory("CONNECT_FAILED Device not found: $address", currentDeviceName)
             return
         }
 
@@ -447,11 +535,21 @@ class BleController(
             appendHistory("CONNECT_REQUEST $address", currentDeviceName)
             closeGatt()
             _connectedAddress.value = null
-            currentGatt = device.connectGatt(appContext, false, gattCallback)
-            appendHistory("CONNECTING $address", currentDeviceName)
+            
+            // For Android 12+ (API 31+), use connectGatt with TRANSPORT_LE flag
+            val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                device.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            } else {
+                device.connectGatt(appContext, false, gattCallback)
+            }
+            currentGatt = gatt
+            appendHistory("CONNECTING $address (autoConnect=false)", currentDeviceName)
         } catch (sec: SecurityException) {
-            _errors.tryEmit("Missing permission to connect.")
-            appendHistory("CONNECT_FAILED Missing permission", currentDeviceName)
+            _errors.tryEmit("Missing permission to connect. Please grant BLUETOOTH_CONNECT permission.")
+            appendHistory("CONNECT_FAILED Missing permission: ${sec.message}", currentDeviceName)
+        } catch (e: Exception) {
+            _errors.tryEmit("Connection error: ${e.message}")
+            appendHistory("CONNECT_FAILED Exception: ${e.message}", currentDeviceName)
         }
     }
 
@@ -483,12 +581,15 @@ class BleController(
         closeGatt()
         mainHandler.removeCallbacks(rssiReader)
         cancelReconnect()
+        stopDeviceCleanupJob()
         autoReconnectDevice = null
         _automationState.value = false
         sessionActive = false
         synchronized(logLock) { sessionLog.clear() }
         _historyRecords.value = emptyList()
         currentDeviceName = null
+        devicesCache.clear()
+        _devices.value = emptyList()
         advertiser?.let {
             // nothing to close
         }
@@ -578,18 +679,48 @@ class BleController(
     }
 
     private fun addOrUpdateDevice(result: ScanResult) {
-        val identifier = deviceIdentifier(result) ?: return
         val device = result.device
+        val address = device?.address
+        if (address.isNullOrBlank()) return
+        
+        // Always use MAC address as identifier to prevent duplicates when name changes
+        val identifier = address
         val advertiseName = readAdvertisedName(result)
-        val entry = CachedDevice(
-            identifier = identifier,
-            device = device,
-            displayName = parseDisplayName(result),
-            advertiseName = advertiseName,
-            rssi = result.rssi,
-            lastSeen = System.currentTimeMillis(),
-            isConnected = _connectedAddress.value == device?.address || device?.isConnected(bluetoothManager) == true
-        )
+        val displayName = parseDisplayName(result)
+        
+        // Check if device exists with different identifier (e.g., old name-based identifier)
+        val existingKey = findDeviceByAddress(address)
+        val existingEntry = existingKey?.let { devicesCache[it] }
+        
+        if (existingKey != null && existingKey != identifier) {
+            // Remove old entry with different identifier to prevent duplicates
+            devicesCache.remove(existingKey)
+        }
+        
+        val entry = if (existingEntry != null) {
+            // Update existing device with new name/info
+            existingEntry.copy(
+                identifier = identifier, // Update to use MAC address as identifier
+                device = device,
+                displayName = displayName,
+                advertiseName = advertiseName,
+                rssi = result.rssi,
+                lastSeen = System.currentTimeMillis(),
+                isConnected = _connectedAddress.value == address || device?.isConnected(bluetoothManager) == true
+            )
+        } else {
+            // New device
+            CachedDevice(
+                identifier = identifier,
+                device = device,
+                displayName = displayName,
+                advertiseName = advertiseName,
+                rssi = result.rssi,
+                lastSeen = System.currentTimeMillis(),
+                isConnected = _connectedAddress.value == address || device?.isConnected(bluetoothManager) == true
+            )
+        }
+        
         devicesCache[identifier] = entry
         publishDevicesSnapshot()
     }
@@ -671,22 +802,81 @@ class BleController(
         synchronized(logLock) { sessionLog.toList() }
 
     private fun publishDevicesSnapshot() {
-        val snapshots = devicesCache.values.map { cached ->
-            val rssi = cached.rssi
-            DeviceSnapshot(
-                address = cached.identifier,
-                displayName = cached.displayName,
-                rawName = cached.device?.name,
-                rssi = rssi,
-                signalQualityPercent = rssi?.let { it.toSignalPercent() },
-                estimatedDistanceMeters = rssi?.let { it.toDistanceMeters() },
-                isBonded = cached.device?.bondState == BluetoothDevice.BOND_BONDED,
-                isConnected = cached.isConnected || (_connectedAddress.value == cached.device?.address),
-                lastSeenTimestamp = cached.lastSeen,
-                advertiseName = cached.advertiseName
-            )
-        }
+        val now = System.currentTimeMillis()
+        val snapshots = devicesCache.values
+            .filter { cached ->
+                // Keep connected devices and devices seen recently
+                val isConnected = cached.isConnected || (_connectedAddress.value == cached.device?.address)
+                val isRecent = (now - cached.lastSeen) < DEVICE_STALE_TIMEOUT_MS
+                isConnected || isRecent
+            }
+            .map { cached ->
+                val rssi = cached.rssi
+                DeviceSnapshot(
+                    address = cached.identifier,
+                    displayName = cached.displayName,
+                    rawName = cached.device?.name,
+                    rssi = rssi,
+                    signalQualityPercent = rssi?.let { it.toSignalPercent() },
+                    estimatedDistanceMeters = rssi?.let { it.toDistanceMeters() },
+                    isBonded = cached.device?.bondState == BluetoothDevice.BOND_BONDED,
+                    isConnected = cached.isConnected || (_connectedAddress.value == cached.device?.address),
+                    lastSeenTimestamp = cached.lastSeen,
+                    advertiseName = cached.advertiseName
+                )
+            }
         _devices.value = snapshots
+    }
+    
+    private fun scheduleDeviceCleanup() {
+        scope.launch {
+            delay(DEVICE_CLEANUP_DELAY_MS)
+            cleanupStaleDevices()
+        }
+    }
+    
+    private fun startDeviceCleanupJob() {
+        stopDeviceCleanupJob()
+        deviceCleanupJob = scope.launch {
+            while (_isScanning.value) {
+                delay(DEVICE_CLEANUP_INTERVAL_MS)
+                if (_isScanning.value) {
+                    cleanupStaleDevices()
+                }
+            }
+        }
+    }
+    
+    private fun stopDeviceCleanupJob() {
+        deviceCleanupJob?.cancel()
+        deviceCleanupJob = null
+    }
+    
+    private fun cleanupStaleDevices() {
+        val now = System.currentTimeMillis()
+        val connectedAddress = _connectedAddress.value
+        val toRemove = mutableListOf<String>()
+        
+        devicesCache.forEach { (key, cached) ->
+            val isConnected = cached.isConnected || (connectedAddress == cached.device?.address)
+            val isStale = (now - cached.lastSeen) >= DEVICE_STALE_TIMEOUT_MS
+            
+            if (!isConnected && isStale) {
+                toRemove.add(key)
+            }
+        }
+        
+        if (toRemove.isNotEmpty()) {
+            toRemove.forEach { key ->
+                devicesCache.remove(key)
+            }
+            publishDevicesSnapshot()
+            if (toRemove.size == 1) {
+                appendHistory("DEVICE_REMOVED_STALE ${toRemove.first()}", currentDeviceName)
+            } else {
+                appendHistory("DEVICES_REMOVED_STALE ${toRemove.size} devices", currentDeviceName)
+            }
+        }
     }
 
     private fun cancelReconnect() {
@@ -708,10 +898,19 @@ class BleController(
             }
             appendHistory("RECONNECT_ATTEMPT ${device.address}", currentDeviceName)
             try {
-                currentGatt = device.connectGatt(appContext, false, gattCallback)
+                // For Android 12+ (API 31+), use connectGatt with TRANSPORT_LE flag
+                currentGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    device.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+                } else {
+                    device.connectGatt(appContext, false, gattCallback)
+                }
             } catch (sec: SecurityException) {
-                _errors.tryEmit("Missing permission to reconnect.")
-                appendHistory("RECONNECT_FAILED_PERMISSION", currentDeviceName)
+                _errors.tryEmit("Missing permission to reconnect. Please grant BLUETOOTH_CONNECT permission.")
+                appendHistory("RECONNECT_FAILED_PERMISSION: ${sec.message}", currentDeviceName)
+                _reconnecting.value = false
+            } catch (e: Exception) {
+                _errors.tryEmit("Reconnect error: ${e.message}")
+                appendHistory("RECONNECT_FAILED Exception: ${e.message}", currentDeviceName)
                 _reconnecting.value = false
             }
         }
@@ -773,5 +972,11 @@ class BleController(
         private const val RECONNECT_INTERVAL_MS = 5_000L
         private const val MAX_HISTORY_RECORDS = 128
         private const val MAX_SERVICE_DATA_BYTES = 12
+        // Device cleanup: remove devices not seen for 10 seconds
+        private const val DEVICE_STALE_TIMEOUT_MS = 10_000L
+        // Delay before cleanup when advertising/scanning stops
+        private const val DEVICE_CLEANUP_DELAY_MS = 2_000L
+        // Interval for periodic cleanup while scanning
+        private const val DEVICE_CLEANUP_INTERVAL_MS = 5_000L
     }
 }
